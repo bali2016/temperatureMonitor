@@ -1,3 +1,6 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
 # *****************************************************************************
 # Copyright (c) 2017 IBM Corporation and other Contributors.
 #
@@ -21,36 +24,56 @@ import os
 import random
 import ibmiotf.device
 import RPi.GPIO as GPIO
+from w1thermsensor import W1ThermSensor
+import itchat
+from temperature import Temperature
+
+
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(13, GPIO.OUT)
 
 
-# Variables
+# Global Variables
 motor_up_time = time.time()
 running_status = False
-
+publish_count = 0
+alert_user_name = None
 
 def usage():
     print(
         "commandSender: Raspberry Pi-powered conveyor belt" + "\n" +
         "\n" +
         "Options: " + "\n" +
-        "  -h, --help    Display help information" + "\n" +
-        "  -t, --time    [Mandatory] Time period in minutes to stop" +
-        " the motor, Recommended maximum value is 5" + "\n"
+        "  -h, --help     Display help information" + "\n" +
+        "  -t, --time     Time period in minutes to stop" + "\n" +
+        "  -f, --file     Configuration file path" + "\n" +
+        "  -i, --interval Interval to check and publish data in second" + "\n"
         )
 
 
-class set_interval():  # Timer wrapper
-    def __init__(self, func, sec):
+class SetInterval:  # Timer wrapper
+    def __init__(self, func, interval, max_count=0, max_time=0):
+        self.max_count = max_count
+        self.max_time = max_time * 60.0  # turn to minutes
+        self.start_time = time.time()
+
         def func_wrapper():
-            self.t = threading.Timer(sec, func_wrapper)
-            self.t.start()
-            func()
-        self.t = threading.Timer(sec, func_wrapper)
+            if (self.max_time > 0 and self.start_time + self.max_time > time.time()) or \
+                    (self.max_time == 0 and (self.max_count == 0 or publish_count < self.max_count)):
+                    func()
+                    self.t = threading.Timer(interval, func_wrapper)
+                    self.t.setDaemon(True)
+                    self.t.start()
+            else:
+                print("Got the max detect, stop the interval")
+                stop_and_exit()
+        self.t = threading.Timer(interval, func_wrapper)
+        self.t.setDaemon(True)
         self.t.start()
+        # self.t.join()
 
     def cancel(self):
+        print ("Cancelling the interval")
         self.t.cancel()
 
 
@@ -60,7 +83,7 @@ def start_handler():  # Turn on motor connected in pin 13
         motor_up_time = time.time()
         running_status = True
         GPIO.output(13, GPIO.HIGH)
-        print("starting mototr")
+        print("starting motor")
 
 
 def stop_handler():  # Turn off motor connected in pin 13
@@ -69,7 +92,7 @@ def stop_handler():  # Turn off motor connected in pin 13
         motor_up_time = time.time()
         running_status = False
         GPIO.output(13, GPIO.LOW)
-        print("Stoping the motor")
+        print("Stopping the motor")
 
 
 def my_command_callback(cmd):  # Handle device command
@@ -87,6 +110,15 @@ def my_on_publish_callback():
 def get_cpu_temperature():  # Return CPU temperature as a character string
     res = os.popen('vcgencmd measure_temp').readline()
     return(res.replace("temp=", "").replace("'C\n", ""))
+
+
+def get_baby_temperature():  # Return air temperature as a character string
+    sensor = W1ThermSensor(W1ThermSensor.THERM_SENSOR_DS18B20, "031724fe49ff")
+    baby_temperature = round(float(sensor.get_temperature()), 2)
+    temperature.add(baby_temperature)
+    check_temperature()
+
+    return baby_temperature
 
 
 def get_rpm():  # Return current rpm value
@@ -110,58 +142,126 @@ def get_ay():  # Return accelerometer value
 
 
 def publish():
+        global publish_count
+        publish_count = publish_count + 1
+        print("Send temperature to WIOIP %s" % publish_count)
+
         state = "false"
         if running_status:
             state = "true"
-        data = {'elapsed': int(time.time() - motor_up_time),
-                'running': state,
-                'temperature': round(float(get_cpu_temperature()), 2),
-                'ay': get_ay(),
-                'rpm': get_rpm()}
-        success = device_client.publishEvent(
-            "sensorData",
-            "json",
-            {'d': data},
-            qos=0,
-            on_publish=my_on_publish_callback)
-        if not success:
-            print("Not connected to WIoTP")
+            data = {'elapsed': int(time.time() - motor_up_time),
+                    'running': state,
+                    'temperature': get_baby_temperature(),
+                    'ay': get_ay(),
+                    'rpm': get_rpm()}
+
+            success = device_client.publishEvent(
+                "sensorData",
+                "json",
+                {'d': data},
+                qos=0,
+                # on_publish=my_on_publish_callback
+            )
+            if not success:
+                print("Not connected to WIoTP")
+        else:
+            print("Service is stopped")
+
+
+def send_alert(msg):
+    # name = u"星空2017"
+    name = u"家"
+    global alert_user_name
+    if alert_user_name is None:
+        # friend = itchat.search_friends(name=name)[0]
+        friend = itchat.search_chatrooms(name=u"家")[0]
+        if friend:
+            alert_user_name = friend.UserName
+        else:
+            print('Send alert failed: Can not find such friend with name %s !' % name)
+
+    r = itchat.send(msg, toUserName=alert_user_name)
+    if r:
+        print ("Send alert to %s success" % name)
+    else:
+        print("Send alert failed: " + r['BaseResponse']['RawMsg'])
+
+
+def stop_alert_client():
+    itchat.dump_login_status()
+
+
+def check_temperature():
+    print ("Trend: %s, trend_count: %s, latest %s, normal: %s" %
+           (temperature.temperature_trend,
+            temperature.temperature_trend_count,
+            temperature.get_latest_temperature(),
+            temperature.normal_temperature))
+    # first store the latest temperature
+    if temperature.temperature_trend == 1\
+            and temperature.temperature_trend_count >= 10\
+            and temperature.get_latest_temperature() > temperature.normal_temperature + 5:
+        # send_alert("Temperature goes too hot " + str(temperature.get_latest_temperature()) + u"℃")
+        send_alert(u"尿了，快来换尿布！！！")
+        temperature.reset_trend()
+        return
+
+    if temperature.temperature_trend == -1\
+            and temperature.temperature_trend_count >= 10\
+            and temperature.get_latest_temperature() < temperature.normal_temperature - 5:
+        send_alert("Temperature goes too cold " + str(temperature.get_latest_temperature()) + u"℃")
+        temperature.reset_trend()
+        return
 
 
 def signal_handler(signal, frame):
     print ('You pressed Ctrl+C!')
-    timeout.cancel()
-    GPIO.cleanup()
-    # Disconnect the device from the cloud
-    device_client.disconnect()
+    # timeout.cancel()
+    # # stopTimer.cancel()
+    # GPIO.cleanup()
+    # # Disconnect the device from the cloud
+    # device_client.disconnect()
+    stop_and_exit()
 
 
 def stop_and_exit():
     stop_handler()
     timeout.cancel()
+    # stopTimer.cancel()
     GPIO.cleanup()
     device_client.disconnect()
+    stop_alert_client()
     sys.exit()
 
 if __name__ == "__main__":
-    stopTime = 5.0
+    stopTime = 0
+    count = 0
+    interval = 1
+    config_file_path = "device.conf"
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "ht:", ["help", "time="])
-        if len(opts) == 0:
-            print("Input argument missing")
-            GPIO.cleanup()
-            usage()
-            sys.exit()
+        opts, args = getopt.getopt(sys.argv[1:], "ht:c:i:f:", ["help", "time=", "count=", "interval=", "file="])
+        # if len(opts) == 0:
+        #     print("Input argument missing")
+        #     GPIO.cleanup()
+        #     usage()
+        #     sys.exit()
         for o, a in opts:
             if o in ("-t", "--time"):
                 stopTime = float(a)
                 if stopTime > 5.0:
                     print(
-                            "WARNING : Motor stop time period you have set" +
-                            " is more than recommended value " +
-                            "(5 min),However the motor will run " +
-                            "till the time you have set"
+                            "INFO: Motor will run for about %s minutes" % stopTime
                           )
+            elif o in ("-c", "--count"):
+                count = int(a)
+                if count > 0:
+                    print("INFO: Motor will stop at %s times publish" % count)
+            elif o in ("-i", "--interval"):
+                interval = int(a)
+                if interval > 0:
+                    print("INFO: Motor will check and publish data every %s seconds" % interval)
+            elif o in ("-f", "--file"):
+                config_file_path = a
             elif o in ("-h", "--help"):
                 GPIO.cleanup()
                 usage()
@@ -174,9 +274,15 @@ if __name__ == "__main__":
         GPIO.cleanup()
         usage()
         sys.exit(2)
+
+    # Initialize the WeXin alert client, and keeps running
+    itchat.auto_login(hotReload=True, enableCmdQR=2)
+    itchat.run(blockThread=False)
+    # itchat.run()
+
     # Initialize the device client.
     try:
-        device_file = "device.conf"
+        device_file = config_file_path
         device_options = ibmiotf.device.ParseConfigFile(device_file)
         device_client = ibmiotf.device.Client(device_options)
     except Exception as e:
@@ -184,15 +290,23 @@ if __name__ == "__main__":
             GPIO.cleanup()
             sys.exit()
 
+    temperature = Temperature(normal_temperature=20, auto_adjust=True, accuracy=0.1)
+
     device_client.connect()
     device_client.commandCallback = my_command_callback
 
-    timeout = set_interval(publish, 1)
+    timeout = SetInterval(publish, interval, count, stopTime)
     start_handler()
 
-    print ("Motor will stop in %s min" % str(stopTime))
-    r = threading.Timer(stopTime*60.0, stop_and_exit)
-    r.start()
+    # if stopTime > 0:
+    #     print ("Motor will stop in %s min" % str(stopTime))
+    #     stopTimer = threading.Timer(stopTime*60.0, stop_and_exit)
+    #     stopTimer.start()
 
     signal.signal(signal.SIGINT, signal_handler)
     print ('Press Ctrl+C to exit')
+
+    # global running_status
+    while running_status:
+        time.sleep(1)
+
